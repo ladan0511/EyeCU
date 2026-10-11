@@ -1,0 +1,258 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Eye</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon-192.png">
+<meta name="theme-color" content="#12161b">
+<style>
+:root{--bg:#12161b;--panel:#1b2128;--line:#2b343e;--text:#e8edf2;--muted:#8d9aa7;--iris:#4a9be0;--warn:#e0a24a}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{height:100%}
+body{margin:0;display:flex;justify-content:center;background:var(--bg);color:var(--text);font:17px/1.4 system-ui,sans-serif;padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom)}
+main{width:100%;max-width:420px;padding:28px 20px 40px}
+[hidden]{display:none!important}
+h1{font-size:24px;font-weight:600;margin:0 0 2px}
+button{height:64px;border-radius:14px;border:1px solid var(--line);background:var(--panel);color:var(--text);font:inherit;font-weight:500}
+button:active{background:var(--iris);border-color:var(--iris);color:#06121d}
+button:disabled{opacity:.5}
+.muted{color:var(--muted)}
+#v-connect{min-height:80vh;display:flex;flex-direction:column;justify-content:center;gap:14px;text-align:center}
+#v-connect img{width:96px;height:96px;border-radius:22px;margin:0 auto 8px}
+#cmsg{margin:0 0 10px;color:var(--muted);min-height:2.8em}
+.primary{background:var(--iris);border-color:var(--iris);color:#06121d;font-weight:600}
+header{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:28px}
+#state{margin:0;color:var(--muted);font-size:15px}
+.power{flex:none;width:84px;height:48px;border-radius:24px}
+.power.is-on{background:var(--iris);border-color:var(--iris);color:#06121d}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}
+.wide{width:100%;margin-bottom:28px}
+label{display:block;color:var(--muted);margin-bottom:6px}
+input[type=range]{width:100%;height:40px;accent-color:var(--iris)}
+.ends{display:flex;justify-content:space-between;color:var(--muted);font-size:14px}
+.auto{display:flex;justify-content:space-between;align-items:center;margin-top:28px;padding:16px;background:var(--panel);border:1px solid var(--line);border-radius:14px}
+.auto input{width:26px;height:26px;accent-color:var(--iris)}
+#panel.off{opacity:.35;pointer-events:none}
+.quiet{width:100%;height:52px;background:none;color:var(--muted)}
+.foot{margin-top:36px;display:grid;gap:8px}
+.note{margin:2px 0 0;color:var(--muted);font-size:14px}
+</style>
+</head>
+<body>
+<main>
+
+  <section id="v-connect">
+    <img src="icon-192.png" alt="">
+    <h1>Eye</h1>
+    <p id="cmsg">Turn on Bluetooth, power the eye, then tap Connect.</p>
+    <button id="connectBtn" class="primary" onclick="onConnectClick()">Connect to eye</button>
+    <button id="installBtn" class="quiet" hidden>Install app</button>
+  </section>
+
+  <section id="v-main" hidden>
+    <header>
+      <div>
+        <h1>Eye</h1>
+        <p id="state">Connected.</p>
+      </div>
+      <button id="pwr" class="power" role="switch" aria-checked="true" aria-label="Eye power" onclick="togglePower()">On</button>
+    </header>
+
+    <div id="panel">
+      <div class="row">
+        <button onclick="setLid(0)">Open</button>
+        <button onclick="setLid(100)">Close</button>
+      </div>
+      <button class="wide" onclick="cmd(C.BLINK,0)">Blink</button>
+      <label for="s">Position</label>
+      <input id="s" type="range" min="0" max="100" value="0"
+        onpointerdown="dragging=true" onpointerup="dragging=false"
+        oninput="slide(this.value)" onchange="sync()">
+      <div class="ends"><span>Open</span><span>Closed</span></div>
+      <div class="auto">
+        <span>Blink automatically</span>
+        <input id="auto" type="checkbox" onchange="cmd(C.AUTO,this.checked?1:0)">
+      </div>
+    </div>
+
+    <div class="foot">
+      <button class="quiet" onclick="leave()">Disconnect</button>
+      <button class="quiet" onclick="powerDown()">Power down</button>
+      <p class="note">The eye keeps blinking by itself when this app is closed. Power down puts the board to sleep to save the most charge. Press RESET on the board to wake it.</p>
+    </div>
+  </section>
+
+</main>
+
+<script>
+const SVC = 'e1a70001-6b1c-4f6e-9d3a-5c2b7e8f9a10';
+const CMD = 'e1a70002-6b1c-4f6e-9d3a-5c2b7e8f9a10';
+const STS = 'e1a70003-6b1c-4f6e-9d3a-5c2b7e8f9a10';
+const C = { SET: 1, BLINK: 2, AUTO: 3, POWER: 4, SLEEP: 5 };
+
+const $ = id => document.getElementById(id);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+let device = null, cmdChar = null, stsChar = null;
+let st = { on: true, auto: true, pos: 0 };
+let chain = Promise.resolve();
+let userLeft = false, asleep = false, dragging = false, reconnecting = false;
+
+function view(name) {
+  $('v-connect').hidden = name !== 'connect';
+  $('v-main').hidden = name !== 'main';
+}
+function msg(t) { $('cmsg').textContent = t; }
+
+function render() {
+  $('pwr').textContent = st.on ? 'On' : 'Off';
+  $('pwr').setAttribute('aria-checked', st.on);
+  $('pwr').classList.toggle('is-on', st.on);
+  $('panel').classList.toggle('off', !st.on);
+  $('auto').checked = st.auto;
+  if (!dragging) $('s').value = st.pos;
+  $('state').textContent = !st.on
+    ? 'Off. Lid closed, servo idle.'
+    : (st.auto && st.pos === 0 ? 'On. Blinking.' : 'On.');
+}
+
+// ---- Bluetooth plumbing -------------------------------------------------
+
+// Bluetooth allows one operation at a time, so everything goes through a queue.
+function enqueue(fn) {
+  const p = chain.then(fn);
+  chain = p.catch(() => {});
+  return p;
+}
+function write(id, arg = 0) {
+  return enqueue(() => {
+    const data = new Uint8Array([id, arg]);
+    return cmdChar.writeValueWithResponse
+      ? cmdChar.writeValueWithResponse(data)
+      : cmdChar.writeValue(data);
+  });
+}
+async function readStatus() {
+  const v = await stsChar.readValue();
+  st = { on: v.getUint8(0) === 1, auto: v.getUint8(1) === 1, pos: v.getUint8(2) };
+  render();
+}
+// Ask the board how it is set and update the screen (short wait lets it finish).
+function sync() {
+  return enqueue(async () => { await sleep(90); await readStatus(); }).catch(onFail);
+}
+async function cmd(id, arg) {
+  try { await write(id, arg); await sync(); } catch (e) { onFail(e); }
+}
+function onFail(e) {
+  console.error(e);
+  if (device && device.gatt.connected) $('state').textContent = 'That did not go through. Try again.';
+}
+
+// Slider: send only the newest value, so fast dragging never floods the link.
+let slideVal = null, slideBusy = false;
+async function slide(v) {
+  slideVal = +v;
+  if (slideBusy) return;
+  slideBusy = true;
+  while (slideVal !== null) {
+    const x = slideVal; slideVal = null;
+    try { await write(C.SET, x); } catch (e) { onFail(e); break; }
+    await sleep(60);
+  }
+  slideBusy = false;
+}
+
+// ---- Connecting ---------------------------------------------------------
+
+async function openLink() {
+  msg('Connecting...');
+  const server = await device.gatt.connect();
+  const svc = await server.getPrimaryService(SVC);
+  cmdChar = await svc.getCharacteristic(CMD);
+  stsChar = await svc.getCharacteristic(STS);
+  chain = Promise.resolve();
+  await readStatus();
+  view('main');
+}
+
+async function connectNew() {
+  try {
+    msg('Choose your eye in the list...');
+    device = await navigator.bluetooth.requestDevice({ filters: [{ services: [SVC] }] });
+    device.addEventListener('gattserverdisconnected', onDisc);
+    userLeft = false; asleep = false;
+    await openLink();
+  } catch (e) {
+    view('connect');
+    if (e.name === 'NotFoundError') msg('No eye chosen. Check the board has power, then try again.');
+    else msg('Could not connect: ' + e.message);
+  }
+}
+
+async function onConnectClick() {
+  if (!navigator.bluetooth) {
+    msg('This browser cannot use Bluetooth. Open the app in Chrome on Android.');
+    return;
+  }
+  $('connectBtn').disabled = true;
+  if (device) {
+    try { userLeft = false; asleep = false; await openLink(); $('connectBtn').disabled = false; return; }
+    catch (e) { /* fall through to the chooser */ }
+  }
+  await connectNew();
+  $('connectBtn').disabled = false;
+}
+
+async function onDisc() {
+  if (asleep) { view('connect'); msg('Asleep. Press RESET on the board, then tap Connect.'); return; }
+  if (userLeft) { view('connect'); msg('Disconnected.'); return; }
+  if (reconnecting) return;
+  reconnecting = true;
+  view('connect');
+  $('connectBtn').disabled = true;
+  msg('Connection lost. Reconnecting...');
+  for (let i = 0; i < 3; i++) {
+    await sleep(1500);
+    try { await openLink(); reconnecting = false; $('connectBtn').disabled = false; return; } catch (e) { /* retry */ }
+  }
+  reconnecting = false;
+  $('connectBtn').disabled = false;
+  msg('Could not reconnect. Move closer and tap Connect.');
+}
+
+// ---- Buttons ------------------------------------------------------------
+
+function setLid(v) { $('s').value = v; st.pos = v; cmd(C.SET, v); }
+function togglePower() { cmd(C.POWER, st.on ? 0 : 1); }
+function leave() { userLeft = true; if (device && device.gatt.connected) device.gatt.disconnect(); }
+async function powerDown() {
+  if (!confirm('Put the eye to sleep? Press RESET on the board to wake it.')) return;
+  asleep = true;
+  try { await write(C.SLEEP, 0); } catch (e) { onFail(e); asleep = false; }
+}
+
+// ---- Install + offline --------------------------------------------------
+
+let deferred = null;
+addEventListener('beforeinstallprompt', e => { e.preventDefault(); deferred = e; $('installBtn').hidden = false; });
+$('installBtn').onclick = async () => {
+  if (!deferred) return;
+  deferred.prompt();
+  await deferred.userChoice;
+  deferred = null;
+  $('installBtn').hidden = true;
+};
+addEventListener('appinstalled', () => { $('installBtn').hidden = true; });
+
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js').catch(() => {});
+
+if (!navigator.bluetooth) {
+  msg('This browser cannot use Bluetooth. Open the app in Chrome on Android.');
+  $('connectBtn').disabled = true;
+}
+</script>
+</body>
+</html>
